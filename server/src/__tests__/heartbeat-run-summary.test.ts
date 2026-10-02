@@ -393,6 +393,72 @@ describe("resolveHeartbeatRunResponse", () => {
     });
   });
 
+  it.each(["claude_auth_required", "acpx_auth_required"])(
+    "does not publish raw provider output for %s",
+    (runErrorCode) => {
+      const resolved = resolveHeartbeatRunResponse({
+        runErrorCode,
+        resultJson: {
+          result: "Failed to authenticate: OAuth session expired and could not be refreshed",
+        },
+        finalAgentMessage: {
+          text: "Failed to authenticate: OAuth session expired and could not be refreshed",
+          sourceEventId: "event-auth-failure",
+          channel: "final",
+        },
+      });
+
+      expect(resolved).toMatchObject({
+        text: null,
+        decision: {
+          chosenSource: "none",
+          commentAction: "none",
+          reasonCodes: ["provider_authentication_required"],
+        },
+      });
+    },
+  );
+
+  it.each(["claude_auth_required", "acpx_auth_required"] as const)(
+    "preserves an existing reply before external-chat precedence for %s",
+    (runErrorCode) => {
+      expect(
+        resolveHeartbeatRunResponse({
+          runErrorCode,
+          resultJson: {
+            result: "Failed to authenticate: OAuth session expired",
+          },
+          existingComment: { id: "existing-reply", body: "Earlier safe reply" },
+          preferFinalResponseOverExistingComment: true,
+          finalAgentMessage: {
+            text: "Failed to authenticate: OAuth session expired",
+            sourceEventId: "event-auth-failure",
+            channel: "final",
+          },
+        }),
+      ).toMatchObject({
+        text: "Earlier safe reply",
+        decision: {
+          chosenSource: "existing_issue_comment",
+          commentAction: "reuse",
+          commentId: "existing-reply",
+        },
+      });
+    },
+  );
+
+  it("keeps ordinary provider failures on the existing response path", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        runErrorCode: "provider_quota",
+        resultJson: { result: "The provider quota was exhausted." },
+      }),
+    ).toMatchObject({
+      text: "The provider quota was exhausted.",
+      decision: { commentAction: "create" },
+    });
+  });
+
   it("returns no response instead of an artificial placeholder", () => {
     expect(resolveHeartbeatRunResponse({ resultJson: null })).toMatchObject({
       text: null,

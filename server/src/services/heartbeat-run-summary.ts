@@ -2,6 +2,7 @@ import type {
   RunPresentationDecision,
   RunPresentationSource,
 } from "@paperclipai/shared";
+import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
 
 export const HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS = 500;
 export const HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS = 4_096;
@@ -376,6 +377,8 @@ function decision(
  */
 export function resolveHeartbeatRunResponse(input: {
   resultJson: Record<string, unknown> | null | undefined;
+  /** Classified terminal run error. Authentication failures must not become agent comments. */
+  runErrorCode?: string | null;
   /** Server-owned conversation finalization, after normal governance checks. */
   conversationTurnFinished?: boolean;
   existingComment?: { id: string; body?: string | null } | null;
@@ -392,6 +395,27 @@ export function resolveHeartbeatRunResponse(input: {
     reasonCode?: string;
   } | null;
 }): ResolvedHeartbeatRunResponse {
+  if (isAiAuthenticationFailure(input.runErrorCode)) {
+    const existingText = readCommentText(input.existingComment?.body);
+    if (existingText && input.existingComment) {
+      return {
+        text: existingText,
+        decision: decision("existing_issue_comment", {
+          commentAction: "reuse",
+          commentId: input.existingComment.id,
+          reasonCodes: ["existing_reply_preserved_on_provider_authentication_failure"],
+        }),
+      };
+    }
+    return {
+      text: null,
+      decision: decision("none", {
+        commentAction: "none",
+        reasonCodes: ["provider_authentication_required"],
+      }),
+    };
+  }
+
   const resultJson = record(input.resultJson);
   const finalAgentText = readCommentText(input.finalAgentMessage?.text);
   const explicitProviderFinal = input.finalAgentMessage?.channel === "final";

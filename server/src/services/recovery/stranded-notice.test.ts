@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import {
   DEFAULT_STRANDED_RECOVERY_NOTICE_BODY,
+  buildAuthenticationFailureNotice,
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
@@ -13,6 +14,42 @@ import {
 function allRows(metadata: { sections: Array<{ rows: unknown[] }> }) {
   return metadata.sections.flatMap((section) => section.rows) as Array<Record<string, unknown>>;
 }
+
+describe("authentication failure notices", () => {
+  it.each(["claude_auth_required", "acpx_auth_required"] as const)(
+    "materializes a safe system notice for %s",
+    (errorCode) => {
+      const notice = buildAuthenticationFailureNotice({
+        run: { id: "run-auth", status: "failed", agentId: "agent-1", errorCode },
+      });
+
+      expect(notice.presentation).toMatchObject({
+        kind: "system_notice",
+        tone: "danger",
+      });
+      expect(notice.metadata.sourceRunId).toBe("run-auth");
+      expect(notice.metadata.authorizationReason).toBe("provider_authentication_required");
+      expect(notice.body).toContain("Reconnect the selected AI account");
+      expect(notice.body).not.toContain("CLAUDE_CODE_OAUTH_TOKEN");
+      expect(notice.body).not.toContain("auth login");
+      expect(notice.body).not.toContain("OAuth session");
+      expect(allRows(notice.metadata)).toContainEqual({
+        type: "key_value",
+        label: "Failure code",
+        value: errorCode,
+      });
+    },
+  );
+
+  it("does not prescribe host Claude login for managed or remote execution", () => {
+    const notice = buildAuthenticationFailureNotice({
+      run: { id: "run-remote", status: "failed", errorCode: "acpx_auth_required" },
+    });
+    expect(notice.body).toContain("selected AI account");
+    expect(notice.body).not.toMatch(/claude.*login|login.*claude/i);
+    expect(notice.body).not.toContain("host");
+  });
+});
 
 describe("stranded recovery notice seeds", () => {
   it.each([

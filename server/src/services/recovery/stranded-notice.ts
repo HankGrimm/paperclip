@@ -24,6 +24,51 @@ export type StrandedRecoveryEscalationNotice = {
   metadata: IssueCommentMetadata;
 };
 
+export type AuthenticationFailureNotice = {
+  body: string;
+  presentation: IssueCommentPresentation;
+  metadata: IssueCommentMetadata;
+};
+
+export function buildAuthenticationFailureNotice(input: {
+  run: {
+    id: string;
+    status: string;
+    agentId?: string | null;
+    errorCode: "claude_auth_required" | "acpx_auth_required";
+  };
+}): AuthenticationFailureNotice {
+  const isClaude = input.run.errorCode === "claude_auth_required";
+  const provider = isClaude ? "Claude" : "the selected AI provider";
+  return {
+    body:
+      `Paperclip could not authenticate ${provider} for this run, so it did not publish provider diagnostics as an agent reply. ` +
+      "Reconnect the selected AI account or update the runtime credential, then retry the task.",
+    presentation: systemNoticePresentation({
+      tone: "danger",
+      title: `${provider} authentication required`,
+    }),
+    metadata: {
+      version: 1,
+      sourceRunId: input.run.id,
+      authorizationReason: "provider_authentication_required",
+      sections: [
+        {
+          title: "Authentication",
+          rows: [
+            runLinkRow("Failed run", input.run),
+            keyValueRow("Failure code", input.run.errorCode),
+            keyValueRow(
+              "Next action",
+              "Reconnect the selected AI account or update the runtime credential, then retry the task.",
+            ),
+          ],
+        },
+      ],
+    },
+  };
+}
+
 export const DEFAULT_STRANDED_RECOVERY_NOTICE_BODY =
   "Paperclip could not restore a live execution path for this issue automatically. " +
   "Moving it to `blocked` so it is visible for intervention.";

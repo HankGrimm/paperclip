@@ -519,6 +519,7 @@ import {
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildImmediateExecutionPathRecoveryNoticeSeed,
   buildWorkspaceValidationRecoveryNoticeSeed,
+  buildAuthenticationFailureNotice,
   SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON,
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
@@ -13126,9 +13127,7 @@ export function heartbeatService(
     await db
       .update(agentWakeupRequests)
       .set({ status, ...patch, updatedAt: new Date() })
-      // Reassignment revokes requests transactionally. Late execution settlement
-      // must not turn a revoked request back into authority for a later retry.
-      .where(and(eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
   }
 
   async function addContinuationExhaustedCommentOnce(input: {
@@ -13952,6 +13951,74 @@ export function heartbeatService(
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
     return findHeartbeatRunCompletionComment(comments, resultJson);
+  }
+
+  async function materializeAuthenticationFailureNotice(input: {
+    run: {
+      id: string;
+      companyId: string;
+      issueId: string;
+      status: string;
+      agentId: string;
+      errorCode: "claude_auth_required" | "acpx_auth_required";
+    };
+  }) {
+    await db.transaction(async (tx) => {
+      const lockKey = `heartbeat-auth-notice:${input.run.companyId}:${input.run.issueId}:${input.run.id}`;
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+      );
+      const [existing] = await tx
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, input.run.companyId),
+            eq(issueComments.issueId, input.run.issueId),
+            eq(issueComments.authorType, "system"),
+            sql`${issueComments.metadata}->>'sourceRunId' = ${input.run.id}`,
+            sql`${issueComments.metadata}->>'authorizationReason' = 'provider_authentication_required'`,
+          ),
+        )
+        .limit(1);
+      if (existing) return;
+
+      const notice = buildAuthenticationFailureNotice({
+        run: {
+          id: input.run.id,
+          status: input.run.status,
+          agentId: input.run.agentId,
+          errorCode: input.run.errorCode,
+        },
+      });
+      const noticeComment = await issuesSvc.addComment(
+        input.run.issueId,
+        notice.body,
+        {},
+        {
+          authorType: "system",
+          presentation: notice.presentation,
+          metadata: notice.metadata,
+        },
+        tx,
+      );
+      await logActivity(tx as unknown as Db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.run.id,
+        issueId: input.run.issueId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: input.run.issueId,
+        details: {
+          commentId: noticeComment.id,
+          source: "run_authentication_failure_notice",
+          failureCode: input.run.errorCode,
+        },
+      });
+    });
   }
 
   async function findLatestCompletedFinalAgentMessage(
@@ -17193,7 +17260,6 @@ export function heartbeatService(
                 eq(agentWakeupRequests.companyId, current.companyId),
                 eq(agentWakeupRequests.agentId, current.agentId),
                 eq(agentWakeupRequests.runId, current.id),
-                ne(agentWakeupRequests.status, "cancelled"),
               ),
             );
         await tx
@@ -17932,7 +17998,7 @@ export function heartbeatService(
         await tx
           .update(agentWakeupRequests)
           .set({ status: "queued", claimedAt: null, updatedAt: now })
-          .where(and(eq(agentWakeupRequests.id, released.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+          .where(eq(agentWakeupRequests.id, released.wakeupRequestId));
       }
 
       const context = parseObject(released.contextSnapshot);
@@ -25505,6 +25571,24 @@ export function heartbeatService(
                   persistedResultJson,
                 )
               : null;
+            if (
+              issueId &&
+              !skipRunIssueComment &&
+              (livenessRun.errorCode === "claude_auth_required" ||
+                livenessRun.errorCode === "acpx_auth_required") &&
+              !existingRunComment
+            ) {
+              await materializeAuthenticationFailureNotice({
+                run: {
+                  id: livenessRun.id,
+                  companyId: livenessRun.companyId,
+                  issueId,
+                  status: livenessRun.status,
+                  agentId: agent.id,
+                  errorCode: livenessRun.errorCode,
+                },
+              });
+            }
             const finalAgentMessage =
               await findLatestCompletedFinalAgentMessage(
                 livenessRun.id,
@@ -25529,6 +25613,7 @@ export function heartbeatService(
             );
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
+              runErrorCode: livenessRun.errorCode,
               conversationTurnFinished: isConversation(issueContext) && livenessRun.status === "succeeded"
                 && persistedResultJson?.finalizationReasonCode === "conversation_turn_finished",
               existingComment: existingRunComment,
@@ -26703,10 +26788,6 @@ export function heartbeatService(
       triggerDetail,
       payload,
     });
-    // Keep each request's own server-derived origin, including coalesced wakes.
-    // A run's merged context cannot establish which caller authored one receipt.
-    // Overwrite caller-supplied nested context rather than trusting it.
-    payload = { ...payload, [DEFERRED_WAKE_CONTEXT_KEY]: { ...enrichedContextSnapshot } };
     let issueId =
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
     if (executionReconciliationWake && !issueId) return null;
@@ -28484,12 +28565,8 @@ export function heartbeatService(
                   or(isNull(heartbeatRuns.nativeIssueId), eq(heartbeatRuns.nativeIssueId, issue.id)),
                 )).then(rows => rows[0] ?? null)
               : null;
-          const canCoalesceComments = !isConversation(issue) && opts.allowRunCoalescing !== false;
-          // A resumed receipt already passed admission under this issue lock.
-          // Consume it with its successor even when chat keeps other messages
-          // in separate turns, or finalization will deliver it a second time.
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments) &&
+            !isConversation(issue) && opts.allowRunCoalescing !== false &&
             !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id))
               ? await tx
                   .select()
@@ -28500,13 +28577,11 @@ export function heartbeatService(
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-                      canCoalesceComments ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
                     ),
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
           const adoptedComments = pendingComments.filter((wake) => {
-            if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
             const deferredContext = parseObject(
